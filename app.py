@@ -11,6 +11,7 @@ Team11 - 부산튜브 시민 반응 분석 대시보드 (3단계 최종본)
 import math
 import os
 import re
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -99,15 +100,23 @@ def resolve_channel(youtube, query):
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_videos(api_key, uploads_id, max_videos):
-    """입력: 업로드 재생목록 ID, 최대 영상 수 / 출력: 영상 메타데이터 DataFrame(유형 포함)."""
+def fetch_videos(api_key, uploads_id, start_date, max_videos):
+    """입력: 업로드 재생목록 ID, 수집 시작일('YYYY-MM-DD'), 최대 영상 수 /
+    출력: 시작일 이후 영상 메타데이터 DataFrame(유형 포함).
+    업로드 목록은 최신순이라 시작일보다 오래된 영상이 나오면 거기서 멈춘다."""
     youtube = build("youtube", "v3", developerKey=api_key)
-    ids, token = [], None
-    while len(ids) < max_videos:
+    ids, token, done = [], None, False
+    while len(ids) < max_videos and not done:
         res = youtube.playlistItems().list(
-            part="contentDetails", playlistId=uploads_id,
-            maxResults=min(50, max_videos - len(ids)), pageToken=token).execute()
-        ids += [i["contentDetails"]["videoId"] for i in res["items"]]
+            part="contentDetails", playlistId=uploads_id, maxResults=50, pageToken=token).execute()
+        for i in res["items"]:
+            published = i["contentDetails"].get("videoPublishedAt", "")[:10]
+            if published and published < start_date:
+                done = True
+                break
+            ids.append(i["contentDetails"]["videoId"])
+            if len(ids) >= max_videos:
+                break
         token = res.get("nextPageToken")
         if not token:
             break
@@ -130,6 +139,13 @@ def fetch_videos(api_key, uploads_id, max_videos):
                 "category": classify_video(title, sec),
             })
     return pd.DataFrame(rows)
+
+
+def sample_by_category(videos, cap):
+    """입력: 영상 DataFrame, 유형별 최대 영상 수 / 출력: 유형마다 cap개까지 무작위(고정 시드)로 뽑은 DataFrame.
+    특정 유형 영상이 너무 많아 분석이 한쪽으로 쏠리는 것을 막는다."""
+    parts = [g.sample(min(len(g), cap), random_state=42) for _, g in videos.groupby("category")]
+    return pd.concat(parts, ignore_index=True) if parts else videos
 
 
 def mask_pii(text):
@@ -313,7 +329,10 @@ api_key = get_api_key()
 with st.sidebar:
     st.header("① 데이터 수집")
     channel_q = st.text_input("채널 (이름, @핸들 또는 채널 ID)", value="부산튜브")
-    max_videos = st.slider("수집할 영상 수", 5, 100, 30, step=5)
+    start_date = st.date_input("수집 시작일 (이 날짜 이후 업로드 영상)",
+                               value=date.today() - timedelta(days=365 * 3), max_value=date.today())
+    max_videos = st.slider("기간 내 영상 최대 개수", 50, 2000, 500, step=50)
+    cap_per_cat = st.slider("유형별 댓글 수집 영상 수", 10, 100, 30, step=5)
     per_video = st.slider("영상당 최대 댓글 수", 10, 300, 100, step=10)
     run = st.button("데이터 수집 시작", type="primary", disabled=not api_key)
     if not api_key:
@@ -328,11 +347,16 @@ if run:
             st.stop()
         ch_title, uploads_id = ch
         with st.spinner("영상 정보를 수집하는 중..."):
-            v = fetch_videos(api_key, uploads_id, max_videos)
+            pool = fetch_videos(api_key, uploads_id, str(start_date), max_videos)
+        if pool.empty:
+            st.warning("선택한 기간에 업로드된 영상이 없습니다. 수집 시작일을 더 과거로 바꿔 보세요.")
+            st.stop()
+        v = sample_by_category(pool, cap_per_cat)
         with st.spinner("댓글을 수집하는 중..."):
             c = fetch_comments(api_key, tuple(v["video_id"]), per_video)
         saved = save_samples(v, c)
         st.session_state["data"] = (ch_title, v, c)
+        st.session_state["pool"] = pool
         st.sidebar.success("수집 완료" + (" (data 폴더에 저장됨)" if saved else ""))
     except HttpError as e:
         st.error(f"YouTube API 오류: {e}")
@@ -377,6 +401,11 @@ f_videos = videos[mask_v]
 f_comments = analyzed[analyzed["video_id"].isin(f_videos["video_id"])]
 
 st.subheader(f"분석 대상: {source_name}")
+if "pool" in st.session_state:
+    pool = st.session_state["pool"].copy()
+    pool["연도"] = pd.to_datetime(pool["published_at"]).dt.year
+    with st.expander(f"수집 기간 내 전체 영상 현황 (총 {len(pool):,}개 중 유형별로 뽑아 댓글을 분석)"):
+        st.dataframe(pd.crosstab(pool["연도"], pool["category"]))
 if f_videos.empty or f_comments.empty:
     st.warning("선택한 조건에 맞는 영상 또는 댓글이 없습니다. 필터를 바꿔 보세요.")
     st.stop()
