@@ -1,5 +1,6 @@
 streamlit
 pandas
 plotly
-kiwipiepy
 google-api-python-client
+kiwipiepy
+wordcloud
