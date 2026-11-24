@@ -5,7 +5,7 @@ Team11 - 부산튜브 시민 반응 분석 대시보드 (3단계 최종본)
 1) YouTube Data API v3로 영상 메타데이터·댓글 수집 (작성자 익명화, 개인정보 마스킹)
 2) 영상 유형 분류 (정책 안내 / 지역 축제·관광 / 숏폼·예능)
 3) Kiwi 형태소 분석 기반 키워드 추출 + 사전 기반 감성 분석
-4) 유형별 비교 시각화, 워드클라우드, 카이제곱 검정
+4) 유형별 비교 시각화, 워드클라우드, 카이제곱 검정, 만위트니 U 검정
 실행: streamlit run app.py
 """
 import math
@@ -278,6 +278,27 @@ def chi_square_test(table):
     return chi2, df, p
 
 
+def mann_whitney_u(a, b):
+    """입력: 두 집단의 값 목록 / 출력: (U 값, p값).
+    두 집단의 순위 합으로 U를 구하고 정규분포 근사로 p값을 계산한다. 동순위 보정 포함."""
+    a = pd.Series(a).dropna()
+    b = pd.Series(b).dropna()
+    n1, n2 = len(a), len(b)
+    if n1 < 2 or n2 < 2:
+        return float("nan"), float("nan")
+    allv = pd.concat([a, b], ignore_index=True)
+    ranks = allv.rank(method="average")
+    u1 = ranks.iloc[:n1].sum() - n1 * (n1 + 1) / 2
+    n = n1 + n2
+    ties = allv.value_counts().astype(float)
+    tie_term = float((ties ** 3 - ties).sum()) / (n * (n - 1))
+    sigma = math.sqrt(n1 * n2 / 12 * ((n + 1) - tie_term))
+    if sigma == 0:
+        return float(u1), float("nan")
+    z = (u1 - n1 * n2 / 2) / sigma
+    return float(u1), math.erfc(abs(z) / math.sqrt(2))
+
+
 def find_korean_font():
     """워드클라우드에 쓸 한글 폰트 경로를 찾는다 (프로젝트 fonts 폴더 → 시스템 폰트 순)."""
     candidates = list(Path("fonts").glob("*.[to]tf")) + [
@@ -304,12 +325,13 @@ def keyword_counts(df, exclude, top_n=30):
 
 
 def show_wordcloud(freq_df):
-    """빈도 DataFrame을 워드클라우드 이미지로 보여 준다 (불가능하면 안내만)."""
+    """빈도 DataFrame을 워드클라우드 이미지로 보여 준다 (불가능하면 안내만). 글자는 모두 가로로 배치한다."""
     font = find_korean_font()
     if WordCloud is None or font is None or freq_df.empty:
         st.caption("워드클라우드를 만들 수 없어 빈도 차트만 표시합니다. (wordcloud 미설치 또는 한글 폰트 없음)")
         return
-    wc = WordCloud(font_path=font, width=800, height=420, background_color="white")
+    wc = WordCloud(font_path=font, width=800, height=420, background_color="white",
+                   prefer_horizontal=1.0)
     wc.generate_from_frequencies(dict(zip(freq_df["키워드"], freq_df["빈도"])))
     st.image(wc.to_array())
 
@@ -441,12 +463,14 @@ left, right = st.columns(2)
 with left:
     metric_label = st.radio("비교 지표", ["조회수", "좋아요 수", "댓글 수"], horizontal=True)
     col = {"조회수": "views", "좋아요 수": "likes", "댓글 수": "comment_count"}[metric_label]
-    by_cat = f_videos.groupby("category").agg(평균=(col, "mean"), 영상수=("video_id", "count")).reset_index()
+    by_cat = f_videos.groupby("category").agg(
+        평균=(col, "mean"), 중앙값=(col, "median"), 영상수=("video_id", "count")).reset_index()
     fig = px.bar(by_cat, x="category", y="평균", text="영상수",
                  labels={"category": "영상 유형", "평균": f"평균 {metric_label}"},
                  title=f"유형별 평균 {metric_label} (막대 위 숫자 = 영상 수)")
     fig.update_traces(texttemplate="%{text}개", textposition="outside")
     st.plotly_chart(fig)
+    st.dataframe(by_cat.rename(columns={"category": "영상 유형"}).round(0))
 with right:
     sent_counts = f_comments["sentiment"].value_counts().reindex(SENT_ORDER).fillna(0).reset_index()
     sent_counts.columns = ["감성", "댓글 수"]
@@ -471,6 +495,19 @@ if {"정책 안내", "숏폼·예능"} <= set(cat_sent.index):
             f"p={p:.4f} → {verdict} (유의수준 0.05)")
 else:
     st.caption("정책 안내와 숏폼·예능 영상이 모두 포함되면 감성 분포 차이 검정 결과가 표시됩니다.")
+
+# 참여도 차이 검정 (정책 안내 vs 숏폼·예능)
+if {"정책 안내", "숏폼·예능"} <= set(f_videos["category"]):
+    ga = f_videos[f_videos["category"] == "정책 안내"][col]
+    gb = f_videos[f_videos["category"] == "숏폼·예능"][col]
+    u_val, p_mw = mann_whitney_u(ga, gb)
+    if math.isnan(p_mw):
+        st.caption("영상 수가 부족해 참여도 차이 검정 결과를 계산할 수 없습니다.")
+    else:
+        verdict2 = "통계적으로 유의한 차이가 있음" if p_mw < 0.05 else "통계적으로 유의한 차이가 있다고 보기 어려움"
+        st.info(f"**정책 안내 vs 숏폼·예능 {metric_label} 만위트니 U 검정**: U={u_val:.1f}, "
+                f"p={p_mw:.4f} → {verdict2} (유의수준 0.05) / "
+                f"중앙값 {ga.median():,.0f} 대 {gb.median():,.0f}")
 
 # ---- 하단: 키워드 / 건의·불만 / 원문 ----
 st.markdown("### 2. 시민들이 많이 언급한 키워드와 건의·불만")
