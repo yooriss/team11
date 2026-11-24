@@ -1,26 +1,86 @@
-"""Team11 - 부산튜브 시민 반응 분석 대시보드 (2단계: 데이터 수집 + 표 확인)"""
+"""
+Team11 - 부산튜브 시민 반응 분석 대시보드 (3단계 최종본)
+
+기능
+1) YouTube Data API v3로 영상 메타데이터·댓글 수집 (작성자 익명화, 개인정보 마스킹)
+2) 영상 유형 분류 (정책 안내 / 지역 축제·관광 / 숏폼·예능)
+3) Kiwi 형태소 분석 기반 키워드 추출 + 사전 기반 감성 분석
+4) 유형별 비교 시각화, 워드클라우드, 카이제곱 검정
+실행: streamlit run app.py
+"""
+import math
 import os
+import re
+from pathlib import Path
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+try:  # 워드클라우드는 선택 기능 (설치 안 돼 있으면 막대그래프만 표시)
+    from wordcloud import WordCloud
+except Exception:
+    WordCloud = None
+
 st.set_page_config(page_title="부산튜브 시민 반응 분석", layout="wide")
 
+DATA_DIR = Path("data")
+VIDEOS_CSV = DATA_DIR / "videos_sample.csv"
+COMMENTS_CSV = DATA_DIR / "comments_sample.csv"
 
-# ---------- API 키 ----------
+CATEGORIES = ["정책 안내", "지역 축제·관광", "숏폼·예능", "기타"]
+SENT_ORDER = ["긍정", "중립", "부정"]
+SENT_COLORS = {"긍정": "#4C9F70", "중립": "#B0B7C3", "부정": "#D1495B"}
+
+# ---------------------------------------------------------------------------
+# 1. 영상 유형 분류 (제목 키워드 + 영상 길이)
+# ---------------------------------------------------------------------------
+KEYWORDS = {
+    "숏폼·예능": ["shorts", "숏", "예능", "챌린지", "댄스", "댄댄댄", "브이로그", "vlog", "웹예능",
+                "라이브", "비하인드", "밈", "먹방", "쇼츠"],
+    "지역 축제·관광": ["축제", "관광", "여행", "명소", "페스티벌", "불꽃", "해수욕장", "투어",
+                   "맛집", "야경", "벚꽃", "엑스포", "마켓", "콘서트", "공연"],
+    "정책 안내": ["정책", "지원", "모집", "신청", "안내", "시정", "브리핑", "대책", "회견",
+                "발표", "조례", "복지", "청년", "예산", "사업", "시민", "돌봄", "주택", "교통", "행정"],
+}
+
+
+def parse_duration(iso):
+    """ISO 8601 길이(PT1M30S)를 초 단위 정수로 바꾼다."""
+    m = re.fullmatch(r"P(?:\d+D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso or "")
+    if not m:
+        return 0
+    h, mi, s = (int(x) if x else 0 for x in m.groups())
+    return h * 3600 + mi * 60 + s
+
+
+def classify_video(title, seconds):
+    """입력: 영상 제목, 길이(초) / 출력: 영상 유형 문자열."""
+    t = (title or "").lower()
+    if 0 < seconds <= 60 or any(k in t for k in KEYWORDS["숏폼·예능"]):
+        return "숏폼·예능"
+    if any(k in t for k in KEYWORDS["지역 축제·관광"]):
+        return "지역 축제·관광"
+    if any(k in t for k in KEYWORDS["정책 안내"]):
+        return "정책 안내"
+    return "기타"
+
+
+# ---------------------------------------------------------------------------
+# 2. 데이터 수집 (YouTube Data API v3)
+# ---------------------------------------------------------------------------
 def get_api_key():
-    """Streamlit secrets 또는 환경변수에서 API 키를 읽는다 (코드에 직접 쓰지 않음)."""
+    """secrets.toml 또는 환경변수에서 API 키를 읽는다. 키는 코드에 쓰지 않는다."""
     try:
         return st.secrets["YOUTUBE_API_KEY"]
     except Exception:
         return os.environ.get("YOUTUBE_API_KEY")
 
 
-# ---------- 수집 함수 ----------
 def resolve_channel(youtube, query):
-    """입력(채널 ID / @핸들 / 채널 이름)을 받아 (채널 ID, 채널 제목, 업로드 재생목록 ID)를 반환."""
+    """채널 ID / @핸들 / 이름 → (채널 제목, 업로드 재생목록 ID). 못 찾으면 None."""
     query = query.strip()
     if query.startswith("UC"):
         res = youtube.channels().list(part="snippet,contentDetails", id=query).execute()
@@ -35,12 +95,12 @@ def resolve_channel(youtube, query):
     if not res.get("items"):
         return None
     item = res["items"][0]
-    return item["id"], item["snippet"]["title"], item["contentDetails"]["relatedPlaylists"]["uploads"]
+    return item["snippet"]["title"], item["contentDetails"]["relatedPlaylists"]["uploads"]
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_videos(api_key, uploads_id, max_videos):
-    """입력: 업로드 재생목록 ID, 최대 영상 수 / 출력: 영상 메타데이터 DataFrame."""
+    """입력: 업로드 재생목록 ID, 최대 영상 수 / 출력: 영상 메타데이터 DataFrame(유형 포함)."""
     youtube = build("youtube", "v3", developerKey=api_key)
     ids, token = [], None
     while len(ids) < max_videos:
@@ -54,18 +114,29 @@ def fetch_videos(api_key, uploads_id, max_videos):
 
     rows = []
     for i in range(0, len(ids), 50):
-        res = youtube.videos().list(part="snippet,statistics", id=",".join(ids[i:i + 50])).execute()
+        res = youtube.videos().list(part="snippet,statistics,contentDetails",
+                                    id=",".join(ids[i:i + 50])).execute()
         for v in res["items"]:
             s = v.get("statistics", {})
+            sec = parse_duration(v["contentDetails"].get("duration"))
+            title = v["snippet"]["title"]
             rows.append({
-                "video_id": v["id"],
-                "title": v["snippet"]["title"],
+                "video_id": v["id"], "title": title,
                 "published_at": v["snippet"]["publishedAt"][:10],
+                "duration_sec": sec,
                 "views": int(s.get("viewCount", 0)),
                 "likes": int(s.get("likeCount", 0)),
                 "comment_count": int(s.get("commentCount", 0)),
+                "category": classify_video(title, sec),
             })
     return pd.DataFrame(rows)
+
+
+def mask_pii(text):
+    """댓글 속 전화번호·이메일·@멘션을 가린다 (개인정보 보호)."""
+    text = re.sub(r"01[016789][-\s]?\d{3,4}[-\s]?\d{4}", "[전화번호]", text)
+    text = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", "[이메일]", text)
+    return re.sub(r"@[\w.\-가-힣]+", "@user", text)
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -81,7 +152,7 @@ def fetch_comments(api_key, video_ids, per_video):
                 res = youtube.commentThreads().list(
                     part="snippet", videoId=vid, maxResults=min(100, per_video - got),
                     order="time", textFormat="plainText", pageToken=token).execute()
-            except HttpError:  # 댓글이 막힌 영상 등은 건너뜀
+            except HttpError:  # 댓글이 막힌 영상은 건너뜀
                 break
             for it in res["items"]:
                 c = it["snippet"]["topLevelComment"]["snippet"]
@@ -89,9 +160,8 @@ def fetch_comments(api_key, video_ids, per_video):
                 if name not in alias:
                     alias[name] = f"user_{len(alias) + 1:03d}"
                 rows.append({
-                    "video_id": vid,
-                    "author": alias[name],
-                    "comment": c["textDisplay"],
+                    "video_id": vid, "author": alias[name],
+                    "comment": mask_pii(c["textDisplay"]),
                     "likes": c.get("likeCount", 0),
                     "published_at": c["publishedAt"][:10],
                 })
@@ -102,21 +172,152 @@ def fetch_comments(api_key, video_ids, per_video):
     return pd.DataFrame(rows)
 
 
-# ---------- 화면 ----------
+# ---------------------------------------------------------------------------
+# 3. 텍스트 분석 (Kiwi 형태소 분석 + 감성 사전)
+# ---------------------------------------------------------------------------
+POSITIVE = {
+    "좋", "훌륭", "감사", "고맙", "응원", "최고", "멋지", "대박", "행복", "사랑", "재미있", "재밌",
+    "기대", "축하", "유익", "도움", "편리", "친절", "깔끔", "예쁘", "귀엽", "웃기", "힘내", "화이팅",
+    "파이팅", "수고", "잘하", "칭찬", "존경", "감동", "만족", "따뜻", "든든", "환영", "굿", "추천",
+    "반갑", "신나", "기쁘", "자랑", "희망", "최선", "열정", "노력", "화목", "안전", "쾌적", "혁신",
+}
+NEGATIVE = {
+    "싫", "나쁘", "최악", "짜증", "화나", "분노", "실망", "불편", "불만", "문제", "심각", "불친절",
+    "세금", "낭비", "쓰레기", "혈세", "무능", "답답", "한심", "거짓", "사퇴", "반대", "폐지", "위험",
+    "피해", "부족", "논란", "비판", "아깝", "쓸데없", "엉망", "부끄럽", "창피", "불안", "걱정", "우려",
+    "비싸", "힘들", "민폐", "무책임", "불법", "혼잡", "지저분", "시끄럽", "황당", "어이없", "허술", "비리",
+}
+NEGATORS = {"않", "못", "안", "아니", "없"}
+NEG_ONLY_AFTER = {"않", "못"}  # 감성어 뒤에 붙어 부정 (예: 좋지 않다)
+STOP_NOUNS = {"것", "수", "등", "때", "이번", "하나", "사람", "우리", "저희", "생각", "말", "분",
+              "년", "오늘", "내용", "정도", "부분", "번", "곳", "거", "점", "중"}
+
+
+@st.cache_resource(show_spinner="형태소 분석기 불러오는 중...")
+def get_kiwi():
+    from kiwipiepy import Kiwi
+    return Kiwi()
+
+
+def analyze_text(kiwi, text):
+    """입력: 댓글 문자열 / 출력: (명사 리스트, 감성 점수).
+    감성 점수 = 긍정어 수 - 부정어 수 (직전 '안/못', 직후 '않/못' 부정어가 있으면 극성 반전)."""
+    tokens = kiwi.tokenize(text)
+    nouns, score = [], 0
+    for i, t in enumerate(tokens):
+        if t.tag in ("NNG", "NNP") and len(t.form) >= 2 and t.form not in STOP_NOUNS:
+            nouns.append(t.form)
+        if t.form in POSITIVE or t.form in NEGATIVE:
+            pol = 1 if t.form in POSITIVE else -1
+            prev_neg = i > 0 and tokens[i - 1].form in {"안", "못"}
+            next_neg = any(x.form in NEG_ONLY_AFTER for x in tokens[i + 1:i + 5])
+            if prev_neg or next_neg:
+                pol = -pol
+            score += pol
+    return nouns, score
+
+
+@st.cache_data(show_spinner="댓글을 분석하는 중...")
+def analyze_comments(comments):
+    """입력: 댓글 DataFrame / 출력: nouns(명사 리스트), score, sentiment(긍정·중립·부정) 열이 추가된 DataFrame."""
+    kiwi = get_kiwi()
+    df = comments.copy()
+    results = [analyze_text(kiwi, str(t)) for t in df["comment"]]
+    df["nouns"] = [r[0] for r in results]
+    df["score"] = [r[1] for r in results]
+    df["sentiment"] = df["score"].apply(lambda s: "긍정" if s > 0 else ("부정" if s < 0 else "중립"))
+    return df
+
+
+def chi_square_test(table):
+    """입력: 2×k 분할표(DataFrame) / 출력: (카이제곱 값, 자유도, p값). 자유도 1 또는 2만 지원."""
+    table = table.loc[:, table.sum() > 0]
+    obs = table.values.astype(float)
+    exp = obs.sum(axis=1, keepdims=True) * obs.sum(axis=0, keepdims=True) / obs.sum()
+    chi2 = float(((obs - exp) ** 2 / exp).sum())
+    df = (obs.shape[0] - 1) * (obs.shape[1] - 1)
+    if df == 1:
+        p = math.erfc(math.sqrt(chi2 / 2))
+    elif df == 2:
+        p = math.exp(-chi2 / 2)
+    else:
+        return chi2, df, float("nan")
+    return chi2, df, p
+
+
+def find_korean_font():
+    """워드클라우드에 쓸 한글 폰트 경로를 찾는다 (프로젝트 fonts 폴더 → 시스템 폰트 순)."""
+    candidates = list(Path("fonts").glob("*.[to]tf")) + [
+        Path(p) for p in (
+            "C:/Windows/Fonts/malgun.ttf", "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/Library/Fonts/AppleGothic.ttf",
+            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc")]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    return None
+
+
+def keyword_counts(df, exclude, top_n=30):
+    """입력: 분석된 댓글 DataFrame, 제외 단어 집합 / 출력: 단어 빈도 DataFrame(상위 top_n)."""
+    counts = {}
+    for nouns in df["nouns"]:
+        for w in nouns:
+            if w not in exclude:
+                counts[w] = counts.get(w, 0) + 1
+    out = pd.DataFrame(sorted(counts.items(), key=lambda x: -x[1])[:top_n], columns=["키워드", "빈도"])
+    return out
+
+
+def show_wordcloud(freq_df):
+    """빈도 DataFrame을 워드클라우드 이미지로 보여 준다 (불가능하면 안내만)."""
+    font = find_korean_font()
+    if WordCloud is None or font is None or freq_df.empty:
+        st.caption("워드클라우드를 만들 수 없어 빈도 차트만 표시합니다. (wordcloud 미설치 또는 한글 폰트 없음)")
+        return
+    wc = WordCloud(font_path=font, width=800, height=420, background_color="white")
+    wc.generate_from_frequencies(dict(zip(freq_df["키워드"], freq_df["빈도"])))
+    st.image(wc.to_array())
+
+
+# ---------------------------------------------------------------------------
+# 4. 데이터 불러오기 / 저장
+# ---------------------------------------------------------------------------
+def save_samples(videos, comments):
+    """수집 결과(익명화됨)를 data 폴더에 저장해 두면 키 없이도 앱을 볼 수 있다."""
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+        videos.to_csv(VIDEOS_CSV, index=False, encoding="utf-8-sig")
+        comments.to_csv(COMMENTS_CSV, index=False, encoding="utf-8-sig")
+        return True
+    except Exception:
+        return False
+
+
+def load_samples():
+    """저장된 샘플 CSV가 있으면 (영상, 댓글) DataFrame을 반환, 없으면 None."""
+    if VIDEOS_CSV.exists() and COMMENTS_CSV.exists():
+        return pd.read_csv(VIDEOS_CSV), pd.read_csv(COMMENTS_CSV)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 5. 화면
+# ---------------------------------------------------------------------------
 st.title("부산튜브 시민 반응 분석 대시보드")
-st.caption("Team11 | 부산시 공식 유튜브 영상 메타데이터와 댓글 수집 (중간 단계)")
+st.caption("Team11 | 부산시 공식 유튜브 콘텐츠 유형별 시민 참여도·감성 반응 분석")
 
 api_key = get_api_key()
-if not api_key:
-    st.error("API 키가 없습니다. `.streamlit/secrets.toml`에 YOUTUBE_API_KEY를 설정하세요.")
-    st.stop()
 
 with st.sidebar:
-    st.header("수집 설정")
+    st.header("① 데이터 수집")
     channel_q = st.text_input("채널 (이름, @핸들 또는 채널 ID)", value="부산튜브")
-    max_videos = st.slider("수집할 영상 수", 5, 100, 20, step=5)
-    per_video = st.slider("영상당 최대 댓글 수", 10, 200, 50, step=10)
-    run = st.button("데이터 수집 시작", type="primary")
+    max_videos = st.slider("수집할 영상 수", 5, 100, 30, step=5)
+    per_video = st.slider("영상당 최대 댓글 수", 10, 300, 100, step=10)
+    run = st.button("데이터 수집 시작", type="primary", disabled=not api_key)
+    if not api_key:
+        st.caption("API 키가 없어 저장된 샘플 데이터만 볼 수 있습니다.")
 
 if run:
     try:
@@ -125,30 +326,141 @@ if run:
         if ch is None:
             st.warning("채널을 찾지 못했습니다. 채널 ID(UC로 시작)를 직접 입력해 보세요.")
             st.stop()
-        _, ch_title, uploads_id = ch
+        ch_title, uploads_id = ch
         with st.spinner("영상 정보를 수집하는 중..."):
-            videos = fetch_videos(api_key, uploads_id, max_videos)
+            v = fetch_videos(api_key, uploads_id, max_videos)
         with st.spinner("댓글을 수집하는 중..."):
-            comments = fetch_comments(api_key, tuple(videos["video_id"]), per_video)
-        st.session_state["data"] = (ch_title, videos, comments)
+            c = fetch_comments(api_key, tuple(v["video_id"]), per_video)
+        saved = save_samples(v, c)
+        st.session_state["data"] = (ch_title, v, c)
+        st.sidebar.success("수집 완료" + (" (data 폴더에 저장됨)" if saved else ""))
     except HttpError as e:
         st.error(f"YouTube API 오류: {e}")
         st.stop()
 
 if "data" not in st.session_state:
-    st.info("왼쪽 사이드바에서 설정 후 '데이터 수집 시작'을 눌러 주세요.")
+    loaded = load_samples()
+    if loaded is None:
+        st.info("왼쪽 사이드바에서 '데이터 수집 시작'을 눌러 주세요. (API 키 필요)")
+        st.stop()
+    st.session_state["data"] = ("저장된 샘플 데이터", loaded[0], loaded[1])
+
+source_name, videos, comments = st.session_state["data"]
+videos = videos.copy()
+videos["published_at"] = pd.to_datetime(videos["published_at"])
+if "category" not in videos.columns:
+    videos["category"] = [classify_video(t, 0) for t in videos["title"]]
+
+if comments.empty:
+    st.warning("수집된 댓글이 없습니다. 다른 채널이나 설정으로 다시 수집해 보세요.")
     st.stop()
 
-ch_title, videos, comments = st.session_state["data"]
-st.subheader(f"수집 채널: {ch_title}")
+analyzed = analyze_comments(comments)
+analyzed = analyzed.merge(videos[["video_id", "title", "category"]], on="video_id", how="left")
 
-c1, c2, c3 = st.columns(3)
-c1.metric("수집한 영상 수", len(videos))
-c2.metric("수집한 댓글 수", len(comments))
-c3.metric("영상 평균 조회수", f"{int(videos['views'].mean()):,}" if len(videos) else 0)
+# ---- 사이드바 필터 ----
+with st.sidebar:
+    st.header("② 분석 필터")
+    cat_choice = st.selectbox("영상 카테고리", ["전체"] + CATEGORIES)
+    dmin, dmax = videos["published_at"].min().date(), videos["published_at"].max().date()
+    if dmin < dmax:
+        date_range = st.slider("분석 기간 (영상 업로드일)", dmin, dmax, (dmin, dmax))
+    else:
+        date_range = (dmin, dmax)
+    exclude_txt = st.text_input("키워드에서 제외할 단어 (쉼표로 구분)", value="영상,댓글,부산,시장,정말,진짜,감사")
+    exclude = {w.strip() for w in exclude_txt.split(",") if w.strip()}
 
-st.markdown("### 영상 메타데이터")
-st.dataframe(videos, use_container_width=True)
+mask_v = (videos["published_at"].dt.date >= date_range[0]) & (videos["published_at"].dt.date <= date_range[1])
+if cat_choice != "전체":
+    mask_v &= videos["category"] == cat_choice
+f_videos = videos[mask_v]
+f_comments = analyzed[analyzed["video_id"].isin(f_videos["video_id"])]
 
-st.markdown("### 댓글 데이터 샘플 (작성자 익명화됨)")
-st.dataframe(comments.head(100), use_container_width=True)
+st.subheader(f"분석 대상: {source_name}")
+if f_videos.empty or f_comments.empty:
+    st.warning("선택한 조건에 맞는 영상 또는 댓글이 없습니다. 필터를 바꿔 보세요.")
+    st.stop()
+
+# ---- 요약 지표 ----
+pos_ratio = (f_comments["sentiment"] == "긍정").mean() * 100
+neg_ratio = (f_comments["sentiment"] == "부정").mean() * 100
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("분석 영상 수", f"{len(f_videos):,}")
+m2.metric("수집된 댓글 수", f"{len(f_comments):,}")
+m3.metric("긍정 댓글 비율", f"{pos_ratio:.1f}%")
+m4.metric("부정 댓글 비율", f"{neg_ratio:.1f}%")
+
+# ---- 중단: 유형별 비교 + 감성 비율 ----
+st.markdown("### 1. 영상 유형별 참여도와 감성 반응")
+left, right = st.columns(2)
+with left:
+    metric_label = st.radio("비교 지표", ["조회수", "좋아요 수", "댓글 수"], horizontal=True)
+    col = {"조회수": "views", "좋아요 수": "likes", "댓글 수": "comment_count"}[metric_label]
+    by_cat = f_videos.groupby("category").agg(평균=(col, "mean"), 영상수=("video_id", "count")).reset_index()
+    fig = px.bar(by_cat, x="category", y="평균", text="영상수",
+                 labels={"category": "영상 유형", "평균": f"평균 {metric_label}"},
+                 title=f"유형별 평균 {metric_label} (막대 위 숫자 = 영상 수)")
+    fig.update_traces(texttemplate="%{text}개", textposition="outside")
+    st.plotly_chart(fig)
+with right:
+    sent_counts = f_comments["sentiment"].value_counts().reindex(SENT_ORDER).fillna(0).reset_index()
+    sent_counts.columns = ["감성", "댓글 수"]
+    fig = px.pie(sent_counts, names="감성", values="댓글 수", color="감성",
+                 color_discrete_map=SENT_COLORS, title="댓글 감성 비율", hole=0.35)
+    st.plotly_chart(fig)
+
+# 유형별 감성 비율 (100% 막대)
+cat_sent = pd.crosstab(f_comments["category"], f_comments["sentiment"]).reindex(columns=SENT_ORDER, fill_value=0)
+cat_pct = cat_sent.div(cat_sent.sum(axis=1), axis=0).mul(100).round(1).reset_index().melt(
+    id_vars="category", var_name="감성", value_name="비율(%)")
+fig = px.bar(cat_pct, x="비율(%)", y="category", color="감성", orientation="h", barmode="stack",
+             color_discrete_map=SENT_COLORS, category_orders={"감성": SENT_ORDER},
+             labels={"category": "영상 유형"}, title="영상 유형별 감성 비율")
+st.plotly_chart(fig)
+
+# 카이제곱 검정 (정책 안내 vs 숏폼·예능)
+if {"정책 안내", "숏폼·예능"} <= set(cat_sent.index):
+    chi2, dof, p = chi_square_test(cat_sent.loc[["정책 안내", "숏폼·예능"]])
+    verdict = "통계적으로 유의한 차이가 있음" if p < 0.05 else "통계적으로 유의한 차이가 있다고 보기 어려움"
+    st.info(f"**정책 안내 vs 숏폼·예능 감성 분포 카이제곱 검정**: χ²={chi2:.2f}, 자유도={dof}, "
+            f"p={p:.4f} → {verdict} (유의수준 0.05)")
+else:
+    st.caption("정책 안내와 숏폼·예능 영상이 모두 포함되면 감성 분포 차이 검정 결과가 표시됩니다.")
+
+# ---- 하단: 키워드 / 건의·불만 / 원문 ----
+st.markdown("### 2. 시민들이 많이 언급한 키워드와 건의·불만")
+tab_all, tab_neg, tab_raw = st.tabs(["전체 키워드", "부정 댓글 키워드·원문", "수집 데이터 확인"])
+
+with tab_all:
+    kw = keyword_counts(f_comments, exclude)
+    c1, c2 = st.columns(2)
+    with c1:
+        show_wordcloud(kw)
+    with c2:
+        if kw.empty:
+            st.write("표시할 키워드가 없습니다.")
+        else:
+            fig = px.bar(kw.head(15).iloc[::-1], x="빈도", y="키워드", orientation="h", title="키워드 빈도 TOP 15")
+            st.plotly_chart(fig)
+
+with tab_neg:
+    neg = f_comments[f_comments["sentiment"] == "부정"]
+    if neg.empty:
+        st.write("부정으로 분류된 댓글이 없습니다.")
+    else:
+        kw_neg = keyword_counts(neg, exclude, top_n=15)
+        fig = px.bar(kw_neg.iloc[::-1], x="빈도", y="키워드", orientation="h", title="부정 댓글 키워드 TOP 15")
+        st.plotly_chart(fig)
+        st.write("공감(좋아요)을 많이 받은 부정 댓글")
+        st.dataframe(neg.sort_values("likes", ascending=False)[["category", "title", "comment", "likes"]]
+                     .head(20).rename(columns={"category": "유형", "title": "영상", "comment": "댓글", "likes": "좋아요"}))
+
+with tab_raw:
+    st.write("영상 메타데이터")
+    st.dataframe(f_videos.drop(columns=["duration_sec"], errors="ignore"))
+    st.write("댓글 샘플 (작성자 익명화됨, 개인정보 마스킹됨)")
+    st.dataframe(f_comments[["author", "category", "comment", "sentiment", "likes"]].head(100))
+
+st.divider()
+st.caption("※ 감성 분석은 직접 만든 긍정·부정 단어 사전과 Kiwi 형태소 분석을 이용한 단순 방식이라 "
+           "반어법·문맥은 반영하지 못합니다. 영상 유형도 제목·길이 키워드로 자동 분류한 값입니다.")
