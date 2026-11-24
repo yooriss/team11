@@ -55,6 +55,15 @@ KEYWORDS = {
 }
 
 
+def apply_categories(df):
+    """영상 DataFrame의 유형(category) 열을 제목·길이로 새로 계산한다.
+    수집 결과가 캐시에 남아 있어도 최신 분류 규칙이 적용되도록 수집·불러오기 직후마다 호출한다."""
+    df = df.copy()
+    secs = df["duration_sec"] if "duration_sec" in df.columns else [0] * len(df)
+    df["category"] = [classify_video(t, s) for t, s in zip(df["title"], secs)]
+    return df
+
+
 def parse_duration(iso):
     """ISO 8601 길이(PT1M30S)를 초 단위 정수로 바꾼다."""
     m = re.fullmatch(r"P(?:\d+D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso or "")
@@ -355,7 +364,7 @@ if run:
             st.stop()
         ch_title, uploads_id = ch
         with st.spinner("영상 정보를 수집하는 중..."):
-            pool = fetch_videos(api_key, uploads_id, str(start_date), max_videos)
+            pool = apply_categories(fetch_videos(api_key, uploads_id, str(start_date), max_videos))
         if pool.empty:
             st.warning("선택한 기간에 업로드된 영상이 없습니다. 수집 시작일을 더 과거로 바꿔 보세요.")
             st.stop()
@@ -380,8 +389,7 @@ if "data" not in st.session_state:
 source_name, videos, comments = st.session_state["data"]
 videos = videos.copy()
 videos["published_at"] = pd.to_datetime(videos["published_at"])
-if "category" not in videos.columns:
-    videos["category"] = [classify_video(t, 0) for t in videos["title"]]
+videos = apply_categories(videos)
 
 if comments.empty:
     st.warning("수집된 댓글이 없습니다. 다른 채널이나 설정으로 다시 수집해 보세요.")
