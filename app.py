@@ -542,6 +542,11 @@ with tab_raw:
     st.dataframe(f_videos.drop(columns=["duration_sec"], errors="ignore"))
     st.write("댓글 샘플 (작성자 익명화됨, 개인정보 마스킹됨)")
     st.dataframe(f_comments[["author", "category", "comment", "sentiment", "likes"]].head(100))
+    st.write("분석에 사용한 전체 데이터 내려받기 (필터와 상관없이 전체)")
+    st.download_button("영상 데이터 전체 받기", videos.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="videos_sample.csv", mime="text/csv")
+    st.download_button("댓글 데이터 전체 받기", comments.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="comments_sample.csv", mime="text/csv")
 
 st.divider()
 st.caption("※ 감성 분석은 직접 만든 긍정·부정 단어 사전과 Kiwi 형태소 분석을 이용한 단순 방식이라 "
