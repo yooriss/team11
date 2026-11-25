@@ -18,11 +18,12 @@
 - 제목·영상 길이 기반 영상 유형 자동 분류
 - Kiwi 형태소 분석 기반 명사 키워드 추출, 워드클라우드·빈도 차트
 - 긍정/중립/부정 사전 기반 감성 분석, 유형별 감성 비교, 카이제곱 검정
-
+- 정책 안내와 숏폼·예능의 참여도 차이는 만위트니 U 검정으로 확인
+- 
 ## 실행 방법
 ```bash
 pip install -r requirements.txt
-# .streamlit/secrets.toml 파일을 만들고 YOUTUBE_API_KEY 입력 (secrets.toml.example 참고)
+# .streamlit 폴더에 secrets.toml 파일을 만들고 YOUTUBE_API_KEY = "발급받은 키" 입력
 streamlit run app.py
 ```
 - API 키가 없어도 `data/` 폴더에 저장된 샘플 CSV가 있으면 그 데이터로 화면을 볼 수 있습니다.
@@ -39,5 +40,13 @@ streamlit, pandas, plotly, google-api-python-client, kiwipiepy, wordcloud
 감성 분석은 직접 만든 단어 사전 기반이라 반어법·문맥을 반영하지 못하며, 영상 유형은 제목·길이로 자동 분류한 값입니다.
 
 ## 실행 화면
- ![메타데이터 수집 화면](./screenshot.png) | ![댓글 표 출력 화면](./screenshot2.png) |
+## 실행 화면
+
+메인 대시보드
+
+![메인 대시보드](./screenshot.png)
+
+정책 안내 영상 키워드와 부정 댓글
+
+![정책 안내 키워드와 부정 댓글](./screenshot2.png)
 
