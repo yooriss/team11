@@ -40,7 +40,6 @@ streamlit, pandas, plotly, google-api-python-client, kiwipiepy, wordcloud
 감성 분석은 직접 만든 단어 사전 기반이라 반어법·문맥을 반영하지 못하며, 영상 유형은 제목·길이로 자동 분류한 값입니다.
 
 ## 실행 화면
-## 실행 화면
 
 메인 대시보드
 
